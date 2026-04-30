@@ -1,0 +1,26 @@
+# 数据集文件夹 (千万别传数据集！)
+data/
+datasets/
+C:/Users/18268/Desktop/Fundus/
+
+# 模型权重和训练日志 (文件太大传不上去)
+logs/
+checkpoints/
+results/
+*.pth
+*.pt
+*.npz
+
+# 刚才跑出来的预测图片 (可传可不传，一般忽略)
+predict_results/
+
+# Python 缓存和虚拟环境
+__pycache__/
+*.pyc
+.env
+venv/
+.idea/
+.vscode/
+
+# Jupyter Notebook 缓存
+.ipynb_checkpoints/
