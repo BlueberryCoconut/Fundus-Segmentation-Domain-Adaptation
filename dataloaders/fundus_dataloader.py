@@ -20,9 +20,8 @@ import torch.nn as nn
 
 class FundusSegmentation(Dataset):
     """
-    Fundus segmentation dataset
-    including 5 domain dataset
-    one for test others for training
+    负责加载训练集 (REFUGE)
+    🚨 官方格式：黑底(0), 灰盘(128), 白杯(255)
     """
 
     def __init__(self,
@@ -32,12 +31,6 @@ class FundusSegmentation(Dataset):
                  testid=None,
                  transform=None
                  ):
-        """
-        :param base_dir: path to VOC dataset directory
-        :param split: train/val
-        :param transform: transform to apply
-        """
-        # super().__init__()
         self._base_dir = base_dir
         self.image_list = []
         self.split = split
@@ -48,32 +41,35 @@ class FundusSegmentation(Dataset):
 
         self._image_dir = os.path.join(self._base_dir, dataset, split, 'image')
         print(self._image_dir)
-        imagelist = glob(self._image_dir + "/*.png")  # png
+        imagelist = glob(self._image_dir + "/*.png")
         for image_path in imagelist:
-            gt_path = image_path.replace('image/', 'mask/')  #
-            # gt_path = gt_path.replace('.tif', '-1.tif') #RIGA
+            gt_path = image_path.replace('image/', 'mask/')
             self.image_list.append({'image': image_path, 'label': gt_path, 'id': testid})
 
         self.transform = transform
-        # self._read_img_into_memory()
-        # Display stats
         print('Number of images in {}: {:d}'.format(split, len(self.image_list)))
 
     def __len__(self):
         return len(self.image_list)
 
     def __getitem__(self, index):
-
         _img = Image.open(self.image_list[index]['image']).convert('RGB')
-        _target = Image.open(self.image_list[index]['label'])
-        # 💡 已修复：将 is 改为 == 消除警告
-        if _target.mode == 'RGB':
-            _target = _target.convert('L')
+        _target_pil = Image.open(self.image_list[index]['label'])
+
+        if _target_pil.mode == 'RGB':
+            _target_pil = _target_pil.convert('L')
+
+        _target_np = np.array(_target_pil)
+        label = np.zeros_like(_target_np)
+
+        # 🌟 REFUGE 专属翻译规则 (黑底白杯)
+        label[_target_np < 64] = 0       # 黑底 -> 类别 0 (背景)
+        label[(_target_np >= 64) & (_target_np <= 192)] = 1  # 灰盘 -> 类别 1 (视盘)
+        label[_target_np > 192] = 2      # 白杯 -> 类别 2 (视杯)
+
+        _target = Image.fromarray(label)
         _img_name = self.image_list[index]['image'].split('/')[-1]
 
-        # _img = self.image_pool[index]
-        # _target = self.label_pool[index]
-        # _img_name = self.img_name_pool[index]
         anco_sample = {'image': _img, 'label': _target, 'img_name': _img_name, 'image1': _img}
 
         if self.transform is not None:
@@ -81,29 +77,11 @@ class FundusSegmentation(Dataset):
 
         return anco_sample
 
-    def _read_img_into_memory(self):
 
-        img_num = len(self.image_list)
-        for index in range(img_num):
-            self.image_pool.append(Image.open(self.image_list[index]['image']).convert('RGB'))
-            _target = Image.open(self.image_list[index]['label'])
-            # 💡 已修复：将 is 改为 == 消除警告
-            if _target.mode == 'RGB':
-                _target = _target.convert('L')
-            self.label_pool.append(_target)
-            _img_name = self.image_list[index]['image'].split('/')[-1]
-            self.img_name_pool.append(_img_name)
-
-    def __str__(self):
-        return 'Fundus(split=' + str(self.split) + ')'
-
-
-# 🚀 核心修改点：将 FundusSegmentation_pgdtest 重命名为 FundusSegmentation_pgd
 class FundusSegmentation_pgd(Dataset):
     """
-    Fundus segmentation dataset
-    including 5 domain dataset
-    one for test others for training
+    负责加载测试集 (Domain1)
+    🚨 官方格式：白底(255), 灰盘(128), 黑杯(0)
     """
 
     def __init__(self,
@@ -113,12 +91,6 @@ class FundusSegmentation_pgd(Dataset):
                  testid=None,
                  transform=None
                  ):
-        """
-        :param base_dir: path to VOC dataset directory
-        :param split: train/val
-        :param transform: transform to apply
-        """
-        # super().__init__()
         self._base_dir = base_dir
         self.image_list = []
         self.split = split
@@ -137,7 +109,6 @@ class FundusSegmentation_pgd(Dataset):
             self.image_list.append({'image': p1_path, 'label': gt_path, 'id': testid})
 
         self.transform = transform
-
         print('Number of images in {}: {:d}'.format(split, len(self.image_list)))
 
     def __len__(self):
@@ -145,10 +116,20 @@ class FundusSegmentation_pgd(Dataset):
 
     def __getitem__(self, index):
         _img = Image.open(self.image_list[index]['image']).convert('RGB')
-        _target = Image.open(self.image_list[index]['label'])
-        # 💡 已修复：将 is 改为 == 消除警告
-        if _target.mode == 'RGB':
-            _target = _target.convert('L')
+        _target_pil = Image.open(self.image_list[index]['label'])
+
+        if _target_pil.mode == 'RGB':
+            _target_pil = _target_pil.convert('L')
+
+        _target_np = np.array(_target_pil)
+        label = np.zeros_like(_target_np)
+
+        # 🌟 Domain1 专属翻译规则 (白底黑杯)
+        label[_target_np > 192] = 0      # 白底 -> 类别 0 (背景)
+        label[(_target_np >= 64) & (_target_np <= 192)] = 1  # 灰盘 -> 类别 1 (视盘)
+        label[_target_np < 64] = 2       # 黑杯 -> 类别 2 (视杯)
+
+        _target = Image.fromarray(label)
         _img_name = self.image_list[index]['image'].split('/')[-1]
 
         anco_sample = {'image': _img, 'label': _target, 'img_name': _img_name}
@@ -157,21 +138,5 @@ class FundusSegmentation_pgd(Dataset):
             anco_sample = self.transform(anco_sample)
 
         return anco_sample
-
-    def __str__(self):
-        return 'Fundus(split=' + str(self.split) + ')'
-
-
-if __name__ == '__main__':
-    data_dir = '/mnt/data1/llr_data/Cell'
-    dataset = 'Domain3'
-    # 注意：这里的 CellSegmentation 在你提供的代码中并没有定义，
-    # 如果这部分测试代码不用的话，可以直接忽略或注释掉。
-    # cell_dataset = CellSegmentation(base_dir=data_dir, dataset=dataset, split='test/')
-
-    # domain_loader = DataLoader(cell_dataset, batch_size=4, shuffle=False, num_workers=0, pin_memory=True)
-    # for batch_idx, (sample) in enumerate(domain_loader):
-    #         data, img_name = sample['image'], sample['img_name']
-    #         print(img_name)
     
     
