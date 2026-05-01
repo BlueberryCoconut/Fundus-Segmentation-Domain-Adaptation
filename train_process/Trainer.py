@@ -32,42 +32,44 @@ class Trainer(object):
 
     def train_epoch(self):
         self.model_gen.train()
-        # 保持 BN 锁定[cite: 2]
+        # 锁定 BN 统计量[cite: 3]
         for m in self.model_gen.modules():
             if isinstance(m, torch.nn.BatchNorm2d): m.eval()
 
         tqdm_gen = tqdm.tqdm(enumerate(self.domain_loaderS), total=len(self.domain_loaderS), desc=f"Epoch {self.epoch}")
         for _, sample in tqdm_gen:
             img = sample['image'].cuda()
-            static_mask = sample['label'].cuda().long()
+
+            # 第一步：获取当前模型的“实时猜测” (不计算梯度)[cite: 4]
+            with torch.no_grad():
+                out_soft, _, feat_raw = self.model_gen(img)
+                # 🌟 创新点：不再使用 static_mask，改用模型当前的预测作为在线伪标签
+                live_label = torch.argmax(out_soft, dim=1)
 
             self.optimizer_gen.zero_grad()
             with autocast(device_type='cuda'):
-                # 1. 第一次前向传播（不记录梯度），获取当前模型预测
-                with torch.no_grad():
-                    out_raw, _, feat_raw = self.model_gen(img)
-                    # 🌟 创新点：将静态标签与实时预测结合（取交集或加权）
-                    live_label = torch.argmax(out_raw, dim=1)
+                # 第二步：正常前向传播
+                out, _, feat = self.model_gen(img)
 
-                # 2. 计算 ProDA 权重
-                # 这里我们利用模型当前的实时预测 live_label 来更新质心，而不是死守 static_mask
-                weights = self.get_proda_weights(feat_raw, live_label)
+                # 第三步：利用 ProDA 计算当前预测的可信度[cite: 4]
+                # 这里传的是实时生成的 live_label
+                weights = self.get_proda_weights(feat, live_label)
 
-                # 3. 第二次前向传播（正常训练）
-                out, _, _ = self.model_gen(img)
+                # 第四步：计算 Loss
+                # 让模型去拟合它自己认为“对”的像素，但 ProDA 权重会压制那些乱猜的噪声像素
+                ce_loss_map = self.criterion(out, live_label)
 
-                # 4. 计算 Loss：让模型去学习“经过 ProDA 提纯后”的实时预测
-                ce_loss_map = self.criterion(out, live_label)  # 🌟 换成 live_label
-
-                weights_full = F.interpolate(weights.unsqueeze(1), size=(img.shape[2], img.shape[3]),
-                                             mode='bilinear').squeeze(1)
+                weights_full = F.interpolate(weights.unsqueeze(1),
+                                             size=(img.shape[2], img.shape[3]),
+                                             mode='bilinear', align_corners=True).squeeze(1)
 
                 # 最终 Loss
-                loss = (ce_loss_map * weights_full).mean()
+                loss = (ce_loss_map * weights_full).mean() + 0.1 * self.calculate_prototype_loss(feat, live_label)
 
             self.scaler.scale(loss).backward()
             self.scaler.step(self.optimizer_gen)
             self.scaler.update()
+            tqdm_gen.set_postfix(loss=f"{loss.item():.4f}")
     def get_proda_weights(self, feature, mask):
         """ 核心创新：计算 ProDA 在线去噪权重[cite: 1] """
         B, C, H, W = feature.size()
