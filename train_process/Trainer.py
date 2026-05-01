@@ -1,45 +1,18 @@
 import os
-import os.path as osp
 import torch
 import tqdm
 import numpy as np
-from torch.cuda.amp import autocast, GradScaler
+import cv2
+import torch.nn.functional as F
+from torch.amp import autocast, GradScaler
+
 
 class Trainer(object):
-    def __init__(self, cuda, model_gen, model_dis, model_uncertainty_dis,
-                 optimizer_gen, optimizer_dis, optimizer_uncertainty_dis,
-                 lr_gen, lr_dis, lr_decrease_rate, val_loader,
-                 domain_loaderS, domain_loaderT, out, max_epoch, stop_epoch,
-                 interval_validate=1, batch_size=4, warmup_epoch=20):
-        self.cuda = cuda
-        self.model_gen = model_gen
-        self.model_dis = model_dis
-        self.model_dis2 = model_uncertainty_dis
-        self.optimizer_gen = optimizer_gen
-        self.optimizer_dis = optimizer_dis
-        self.optimizer_dis2 = optimizer_uncertainty_dis
-        self.lr_gen = lr_gen
-        self.lr_dis = lr_dis
-        self.lr_decrease_rate = lr_decrease_rate
-        self.val_loader = val_loader
-        self.domain_loaderS = domain_loaderS
-        self.domain_loaderT = domain_loaderT
-        self.out = out
-        self.max_epoch = max_epoch
-        self.stop_epoch = stop_epoch
-        self.interval_validate = interval_validate
-        self.batch_size = batch_size
-        self.warmup_epoch = warmup_epoch
-
-        self.epoch = 0
-        self.iteration = 0
-        self.best_dice = 0.0
-
-        # 损失函数
+    def __init__(self, **kwargs):
+        for k, v in kwargs.items(): setattr(self, k, v)
+        self.epoch, self.best_dice = 0, 0.0
         self.criterion = torch.nn.CrossEntropyLoss()
-        # 🌟 兼容 AMP 混合精度的安全对抗损失函数
-        self.bce_loss = torch.nn.BCEWithLogitsLoss()
-
+        self.mse_loss = torch.nn.MSELoss()
         self.scaler = GradScaler()
 
     def train(self):
@@ -49,113 +22,67 @@ class Trainer(object):
             if self.epoch % self.interval_validate == 0:
                 self.validate()
 
-            # 学习率衰减
-            if (self.epoch + 1) % 40 == 0:
-                for param_group in self.optimizer_gen.param_groups:
-                    param_group['lr'] *= self.lr_decrease_rate
-
     def train_epoch(self):
         self.model_gen.train()
-        self.model_dis.train()
-        self.model_dis2.train()
-
-        loaderT_iter = iter(self.domain_loaderT)
-
-        tqdm_gen = tqdm.tqdm(
-            enumerate(self.domain_loaderS), total=len(self.domain_loaderS),
-            desc='Train epoch=%d' % self.epoch, ncols=100, leave=False)
-
-        for batch_idx, sampleS in tqdm_gen:
-            # 自动重置目标域数据迭代器
-            try:
-                sampleT = next(loaderT_iter)
-            except StopIteration:
-                loaderT_iter = iter(self.domain_loaderT)
-                sampleT = next(loaderT_iter)
-
-            dataS, labelS = sampleS['image'], sampleS['label']
-            dataT = sampleT['image']
-
-            if self.cuda:
-                dataS, labelS = dataS.cuda(), labelS.cuda()
-                dataT = dataT.cuda()
-
-            # --- 1. 训练生成器 ---
+        tqdm_gen = tqdm.tqdm(enumerate(self.domain_loaderS), total=len(self.domain_loaderS), desc=f"Epoch {self.epoch}")
+        for _, sample in tqdm_gen:
+            img, mask = sample['image'].cuda(), sample['label'].cuda()
             self.optimizer_gen.zero_grad()
-
-            with autocast():
-                out_p, _, _ = self.model_gen(dataS)
-                loss_seg = self.criterion(out_p, labelS.long())
-                loss_total = loss_seg
-
-                # 预热期结束后，加入对抗训练
-                if self.epoch >= self.warmup_epoch:
-                    out_p_T, _, _ = self.model_gen(dataT)
-                    D_out = self.model_dis(torch.softmax(out_p_T, dim=1))
-
-                    loss_adv = self.bce_loss(D_out, torch.ones_like(D_out))
-                    loss_total += 0.001 * loss_adv
-
-            self.scaler.scale(loss_total).backward()
+            with autocast(device_type='cuda'):
+                out, _, feat = self.model_gen(img)
+                loss = self.criterion(out, mask.long()) + 0.1 * self.calculate_prototype_loss(feat, mask)
+            self.scaler.scale(loss).backward()
             self.scaler.step(self.optimizer_gen)
             self.scaler.update()
-
-            # --- 2. 训练判别器 ---
-            if self.epoch >= self.warmup_epoch:
-                self.optimizer_dis.zero_grad()
-                with autocast():
-                    out_p_real, _, _ = self.model_gen(dataS)
-                    D_real = self.model_dis(torch.softmax(out_p_real.detach(), dim=1))
-                    loss_D_real = self.bce_loss(D_real, torch.ones_like(D_real))
-
-                    out_p_fake, _, _ = self.model_gen(dataT)
-                    D_fake = self.model_dis(torch.softmax(out_p_fake.detach(), dim=1))
-                    loss_D_fake = self.bce_loss(D_fake, torch.zeros_like(D_fake))
-
-                    loss_D = (loss_D_real + loss_D_fake) / 2
-
-                self.scaler.scale(loss_D).backward()
-                self.scaler.step(self.optimizer_dis)
-                self.scaler.update()
-
-            tqdm_gen.set_postfix(loss='%.4f' % loss_total.item())
-            self.iteration += 1
+            tqdm_gen.set_postfix(loss=f"{loss.item():.4f}")
 
     def validate(self):
         self.model_gen.eval()
         dices = []
         with torch.no_grad():
-            for sample in self.val_loader:
-                data, target = sample['image'], sample['label']
-                if self.cuda:
-                    data, target = data.cuda(), target.cuda()
-
+            for i, sample in enumerate(self.val_loader):
+                data, target = sample['image'].cuda(), sample['label'].cuda()
                 output, _, _ = self.model_gen(data)
                 pred = torch.argmax(output, dim=1)
 
-                dice = self.calculate_dice(pred, target)
-                dices.append(dice)
 
-        current_dice = np.mean(dices)
-        print(f'\n[Epoch {self.epoch}] Validation Dice: {current_dice:.4f}')
+                if i == 0:  # 每一轮保存第一张做对齐检查
+                    # 可视化缩放：0->0, 1->120(灰), 2->240(白)
+                    p_img = (pred[0].cpu().numpy() * 120).astype(np.uint8)
+                    t_img = (target[0].cpu().numpy() * 120).astype(np.uint8)
+                    cv2.imwrite(os.path.join(self.out, f"EP{self.epoch}_PRED.png"), p_img)
+                    cv2.imwrite(os.path.join(self.out, f"EP{self.epoch}_GT.png"), t_img)
 
-        # 保存最优模型
-        if current_dice > self.best_dice:
-            self.best_dice = current_dice
-            torch.save({
-                'epoch': self.epoch,
-                'model_state_dict': self.model_gen.state_dict(),
-                'best_dice': self.best_dice,
-            }, osp.join(self.out, 'best_model.pth'))
+                dices.append(self.calculate_dice(pred, target))
+
+        cur_dice = np.mean(dices)
+        print(f"  [Validation] Dice: {cur_dice:.4f}")
+        if cur_dice > self.best_dice:
+            self.best_dice = cur_dice
+            torch.save(self.model_gen.state_dict(), os.path.join(self.out, 'best_target_model.pth'))
+
 
     def calculate_dice(self, pred, target):
+        """ 计算 0(视杯) 和 1(视盘) 的平均 Dice """
         smooth = 1e-5
         dice_list = []
-        for i in range(1, 3):  # 计算视盘(1)和视杯(2)
+        # 🌟 关键：计算索引 0 和 1
+        for i in range(0, 2):
             p = (pred == i).float()
             t = (target == i).float()
             intersection = (p * t).sum()
             dice = (2. * intersection + smooth) / (p.sum() + t.sum() + smooth)
             dice_list.append(dice.item())
-
         return np.mean(dice_list)
+
+    def calculate_prototype_loss(self, feature, label):
+        B, C, H, W = feature.size()
+        label_down = F.interpolate(label.unsqueeze(1).float(), size=(H, W), mode='nearest').squeeze(1)
+        loss_pro, count = 0, 0
+        for i in range(3):  # 遍历 0, 1, 2 三个类别[cite: 7]
+            mask = (label_down == i).unsqueeze(1).expand(-1, C, -1, -1)
+            if mask.any():
+                proto = (feature * mask).sum(dim=(0, 2, 3)) / (mask.sum(dim=(0, 2, 3)) + 1e-6)
+                loss_pro += self.mse_loss(feature * mask, proto.view(1, C, 1, 1) * mask)
+                count += 1
+        return loss_pro / (count + 1e-6)

@@ -3,140 +3,65 @@ import os
 from PIL import Image
 import numpy as np
 from torch.utils.data import Dataset
-from pathlib import Path
 from glob import glob
-import random
-import torch
-import torchvision.transforms as transforms
-import torchvision.transforms.functional as Ft
-import imgaug.augmenters as iaa
-import dataloaders.net as net
-from dataloaders.utils import *
 from dataloaders.mypath import MYPath
-import cv2
-from torch.utils.data import DataLoader
-import torch.nn as nn
-
 
 class FundusSegmentation(Dataset):
-    """
-    负责加载训练集 (REFUGE)
-    🚨 官方格式：黑底(0), 灰盘(128), 白杯(255)
-    """
-
-    def __init__(self,
-                 base_dir=MYPath.db_root_dir('fundus'),
-                 dataset='refuge',
-                 split='train',
-                 testid=None,
-                 transform=None
-                 ):
+    def __init__(self, base_dir=MYPath.db_root_dir('fundus'), dataset='Domain1', split='train/ROIs',
+                 transform=None, pseudo_path=None):
         self._base_dir = base_dir
-        self.image_list = []
-        self.split = split
+        self.dataset = dataset
+        self.pseudo_path = pseudo_path
+        self.pseudo_labels = None
+        self.pseudo_keys = {}
 
-        self.image_pool = []
-        self.label_pool = []
-        self.img_name_pool = []
+        # 1. 加载伪标签 (仅训练阶段使用)[cite: 8]
+        if self.pseudo_path is not None and os.path.exists(self.pseudo_path):
+            self.pseudo_labels = np.load(self.pseudo_path)
+            self.pseudo_keys = {os.path.basename(k).lower(): k for k in self.pseudo_labels.files}
 
+        # 2. 扫描图像路径[cite: 8]
         self._image_dir = os.path.join(self._base_dir, dataset, split, 'image')
-        print(self._image_dir)
-        imagelist = glob(self._image_dir + "/*.png")
+        imagelist = glob(self._image_dir + "/*.png") + glob(self._image_dir + "/*.jpg")
+
+        self.image_list = []
         for image_path in imagelist:
-            gt_path = image_path.replace('image/', 'mask/')
-            self.image_list.append({'image': image_path, 'label': gt_path, 'id': testid})
+            full_name = os.path.basename(image_path).lower()
+            if self.pseudo_path is None or full_name in self.pseudo_keys:
+                gt_path = image_path.replace('image', 'mask')
+                self.image_list.append({'image': image_path, 'label': gt_path})
 
         self.transform = transform
-        print('Number of images in {}: {:d}'.format(split, len(self.image_list)))
+        print(f'✅ 加载 {len(self.image_list)} 张图片 (模式: {"伪标签训练" if self.pseudo_path else "标准验证"})')
 
     def __len__(self):
         return len(self.image_list)
 
     def __getitem__(self, index):
         _img = Image.open(self.image_list[index]['image']).convert('RGB')
-        _target_pil = Image.open(self.image_list[index]['label'])
+        _full_name = os.path.basename(self.image_list[index]['image'])
+        _pure_name = _full_name.lower()
 
-        if _target_pil.mode == 'RGB':
-            _target_pil = _target_pil.convert('L')
+        _target = None
+        if self.pseudo_labels is not None:
+            target_key = self.pseudo_keys.get(_pure_name) or self.pseudo_keys.get(_pure_name.rsplit('.', 1)[0])
+            if target_key:
+                _target = Image.fromarray(self.pseudo_labels[target_key])
 
-        _target_np = np.array(_target_pil)
-        label = np.zeros_like(_target_np)
+        if _target is None:
+            _target_np = np.array(Image.open(self.image_list[index]['label']).convert('L'))
+            label = np.zeros_like(_target_np)
 
-        # 🌟 REFUGE 专属翻译规则 (黑底白杯)
-        label[_target_np < 64] = 0       # 黑底 -> 类别 0 (背景)
-        label[(_target_np >= 64) & (_target_np <= 192)] = 1  # 灰盘 -> 类别 1 (视盘)
-        label[_target_np > 192] = 2      # 白杯 -> 类别 2 (视杯)
+            # 🌟 真理映射 (方案 A)：0=黑(杯), 1=灰(盘), 2=白(背景)
+            label[_target_np < 64] = 0  # 黑色 -> 0
+            label[(_target_np >= 64) & (_target_np <= 192)] = 1  # 灰色 -> 1
+            label[_target_np > 192] = 2  # 白色 -> 2
 
-        _target = Image.fromarray(label)
-        _img_name = self.image_list[index]['image'].split('/')[-1]
+            _target = Image.fromarray(label)
 
-        anco_sample = {'image': _img, 'label': _target, 'img_name': _img_name, 'image1': _img}
-
+        sample = {'image': _img, 'label': _target, 'img_name': _full_name}
         if self.transform is not None:
-            anco_sample = self.transform(anco_sample)
+            sample = self.transform(sample)
+        return sample
 
-        return anco_sample
-
-
-class FundusSegmentation_pgd(Dataset):
-    """
-    负责加载测试集 (Domain1)
-    🚨 官方格式：白底(255), 灰盘(128), 黑杯(0)
-    """
-
-    def __init__(self,
-                 base_dir=MYPath.db_root_dir('fundus'),
-                 dataset='refuge',
-                 split='train',
-                 testid=None,
-                 transform=None
-                 ):
-        self._base_dir = base_dir
-        self.image_list = []
-        self.split = split
-
-        self.image_pool = []
-        self.label_pool = []
-        self.img_name_pool = []
-
-        self._image_dir = os.path.join(self._base_dir, dataset, split, 'image')
-        print(self._image_dir + '/pgd')
-        imagelist = glob(self._image_dir + "/*.png")
-
-        for image_path in imagelist:
-            gt_path = image_path.replace('image', 'mask')
-            p1_path = image_path.replace('Domain1/test/ROIs/image/', 'PGD/DPL/Domain1/')
-            self.image_list.append({'image': p1_path, 'label': gt_path, 'id': testid})
-
-        self.transform = transform
-        print('Number of images in {}: {:d}'.format(split, len(self.image_list)))
-
-    def __len__(self):
-        return len(self.image_list)
-
-    def __getitem__(self, index):
-        _img = Image.open(self.image_list[index]['image']).convert('RGB')
-        _target_pil = Image.open(self.image_list[index]['label'])
-
-        if _target_pil.mode == 'RGB':
-            _target_pil = _target_pil.convert('L')
-
-        _target_np = np.array(_target_pil)
-        label = np.zeros_like(_target_np)
-
-        # 🌟 Domain1 专属翻译规则 (白底黑杯)
-        label[_target_np > 192] = 0      # 白底 -> 类别 0 (背景)
-        label[(_target_np >= 64) & (_target_np <= 192)] = 1  # 灰盘 -> 类别 1 (视盘)
-        label[_target_np < 64] = 2       # 黑杯 -> 类别 2 (视杯)
-
-        _target = Image.fromarray(label)
-        _img_name = self.image_list[index]['image'].split('/')[-1]
-
-        anco_sample = {'image': _img, 'label': _target, 'img_name': _img_name}
-
-        if self.transform is not None:
-            anco_sample = self.transform(anco_sample)
-
-        return anco_sample
-    
     
