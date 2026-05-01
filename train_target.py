@@ -11,15 +11,18 @@ from train_process.Trainer import Trainer
 
 def main():
     parser = argparse.ArgumentParser(description="Stage 3 Final Training")
-    parser.add_argument('--dataset', type=str, default='Domain1')
 
-    # 🌟 路径实锤：指向 0.81 分的最佳 UDA 模型[cite: 8]
-    # 🌟 路径指向 weighted_run 里的真神！
+    # 🌟 1. 把目标域改成 Domain2
+    parser.add_argument('--dataset', type=str, default='Domain2')
+
+    # 路径保持指向你的 0.81 分真神模型
     parser.add_argument('--model-file', type=str,
                         default=r'C:\Users\18268\Desktop\PLPB-main\logs\weighted_run\best_model.pth')
 
     parser.add_argument('--data-dir', default=r'C:\Users\18268\Desktop\Fundus')
-    parser.add_argument('--out', default='logs/final_uda_run')
+
+    # 🌟 2. 强烈建议：把输出文件夹改个名，防止覆盖你刚才跑出来的 Domain1 0.70 分结果！
+    parser.add_argument('--out', default='logs/final_uda_run_D2')
     parser.add_argument('--batch-size', type=int, default=4)
     parser.add_argument('--lr', type=float, default=1e-5)
 
