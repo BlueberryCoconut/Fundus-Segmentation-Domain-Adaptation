@@ -24,7 +24,7 @@ def main():
     # 🌟 2. 强烈建议：把输出文件夹改个名，防止覆盖你刚才跑出来的 Domain1 0.70 分结果！
     parser.add_argument('--out', default='logs/final_uda_run_D2')
     parser.add_argument('--batch-size', type=int, default=4)
-    parser.add_argument('--lr', type=float, default=1e-5)
+    parser.add_argument('--lr', type=float, default=1e-6)
 
     args = parser.parse_args()
     os.makedirs(args.out, exist_ok=True)

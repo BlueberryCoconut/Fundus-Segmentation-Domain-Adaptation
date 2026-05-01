@@ -9,11 +9,19 @@ from torch.amp import autocast, GradScaler
 
 class Trainer(object):
     def __init__(self, **kwargs):
+        # 基础属性初始化
         for k, v in kwargs.items(): setattr(self, k, v)
         self.epoch, self.best_dice = 0, 0.0
-        self.criterion = torch.nn.CrossEntropyLoss()
+
+        # 🌟 关键点 1：必须设为 none，以便后续对每个像素应用不同的去噪权重
+        self.criterion = torch.nn.CrossEntropyLoss(reduction='none')
         self.mse_loss = torch.nn.MSELoss()
         self.scaler = GradScaler()
+
+        # 🌟 ProDA 核心配置
+        self.lambda_momentum = 0.999  # 质心动量更新系数
+        self.prototypes = None  # 全局类质心寄存器
+        self.tau = 10.0  # 距离缩放温度系数
 
     def train(self):
         for epoch in range(self.epoch, self.max_epoch):
@@ -24,17 +32,78 @@ class Trainer(object):
 
     def train_epoch(self):
         self.model_gen.train()
+        # 保持 BN 锁定[cite: 2]
+        for m in self.model_gen.modules():
+            if isinstance(m, torch.nn.BatchNorm2d): m.eval()
+
         tqdm_gen = tqdm.tqdm(enumerate(self.domain_loaderS), total=len(self.domain_loaderS), desc=f"Epoch {self.epoch}")
         for _, sample in tqdm_gen:
-            img, mask = sample['image'].cuda(), sample['label'].cuda()
+            img = sample['image'].cuda()
+            static_mask = sample['label'].cuda().long()
+
             self.optimizer_gen.zero_grad()
             with autocast(device_type='cuda'):
-                out, _, feat = self.model_gen(img)
-                loss = self.criterion(out, mask.long()) + 0.1 * self.calculate_prototype_loss(feat, mask)
+                # 1. 第一次前向传播（不记录梯度），获取当前模型预测
+                with torch.no_grad():
+                    out_raw, _, feat_raw = self.model_gen(img)
+                    # 🌟 创新点：将静态标签与实时预测结合（取交集或加权）
+                    live_label = torch.argmax(out_raw, dim=1)
+
+                # 2. 计算 ProDA 权重
+                # 这里我们利用模型当前的实时预测 live_label 来更新质心，而不是死守 static_mask
+                weights = self.get_proda_weights(feat_raw, live_label)
+
+                # 3. 第二次前向传播（正常训练）
+                out, _, _ = self.model_gen(img)
+
+                # 4. 计算 Loss：让模型去学习“经过 ProDA 提纯后”的实时预测
+                ce_loss_map = self.criterion(out, live_label)  # 🌟 换成 live_label
+
+                weights_full = F.interpolate(weights.unsqueeze(1), size=(img.shape[2], img.shape[3]),
+                                             mode='bilinear').squeeze(1)
+
+                # 最终 Loss
+                loss = (ce_loss_map * weights_full).mean()
+
             self.scaler.scale(loss).backward()
             self.scaler.step(self.optimizer_gen)
             self.scaler.update()
-            tqdm_gen.set_postfix(loss=f"{loss.item():.4f}")
+    def get_proda_weights(self, feature, mask):
+        """ 核心创新：计算 ProDA 在线去噪权重[cite: 1] """
+        B, C, H, W = feature.size()
+        feat_flat = feature.permute(0, 2, 3, 1).reshape(-1, C)  # [N, C]
+
+        # 标签对齐到特征图大小
+        label_down = F.interpolate(mask.unsqueeze(1).float(), size=(H, W), mode='nearest').squeeze(1).long()
+
+        # 1. 计算当前 Batch 的局部类质心[cite: 1]
+        curr_prototypes = torch.zeros(3, C).cuda()
+        for k in range(3):  # 0:背景, 1:视杯, 2:视盘
+            m = (label_down == k)
+            if m.any():
+                curr_prototypes[k] = feature.permute(0, 2, 3, 1)[m].mean(0)
+
+        # 2. 动量更新全局质心 η[cite: 1]
+        if self.prototypes is None:
+            self.prototypes = curr_prototypes.detach()
+        else:
+            self.prototypes = self.lambda_momentum * self.prototypes + \
+                              (1 - self.lambda_momentum) * curr_prototypes.detach()
+
+        # 3. 计算欧式距离距离并转化为 trust weight[cite: 1]
+        # 基于公式 (4)：ω = softmax(-dist/τ)
+        dists = torch.cdist(feat_flat, self.prototypes, p=2)
+        weights_all = F.softmax(-dists / self.tau, dim=1)
+
+        # 提取伪标签指定类别的权重
+        label_flat = label_down.reshape(-1, 1)
+        pixel_weights = torch.gather(weights_all, 1, label_flat).reshape(B, H, W)
+
+        # 🌟 类别重平衡：进一步压低背景（类0）的引力，强迫模型关注病灶
+        class_importance = torch.ones_like(pixel_weights)
+        class_importance[label_down == 0] = 0.1
+
+        return pixel_weights * class_importance
 
     def validate(self):
         self.model_gen.eval()
@@ -45,11 +114,10 @@ class Trainer(object):
                 output, _, _ = self.model_gen(data)
                 pred = torch.argmax(output, dim=1)
 
-
-                if i == 0:  # 每一轮保存第一张做对齐检查
-                    # 可视化缩放：0->0, 1->120(灰), 2->240(白)
+                if i == 0:  # 每一轮保存第一张做对齐检查[cite: 3]
                     p_img = (pred[0].cpu().numpy() * 120).astype(np.uint8)
                     t_img = (target[0].cpu().numpy() * 120).astype(np.uint8)
+                    os.makedirs(self.out, exist_ok=True)
                     cv2.imwrite(os.path.join(self.out, f"EP{self.epoch}_PRED.png"), p_img)
                     cv2.imwrite(os.path.join(self.out, f"EP{self.epoch}_GT.png"), t_img)
 
@@ -61,12 +129,10 @@ class Trainer(object):
             self.best_dice = cur_dice
             torch.save(self.model_gen.state_dict(), os.path.join(self.out, 'best_target_model.pth'))
 
-
     def calculate_dice(self, pred, target):
-        """ 计算 0(视杯) 和 1(视盘) 的平均 Dice """
+        """ 计算 0(视杯) 和 1(视盘) 的平均 Dice[cite: 3] """
         smooth = 1e-5
         dice_list = []
-        # 🌟 关键：计算索引 0 和 1
         for i in range(0, 2):
             p = (pred == i).float()
             t = (target == i).float()
@@ -76,10 +142,11 @@ class Trainer(object):
         return np.mean(dice_list)
 
     def calculate_prototype_loss(self, feature, label):
+        """ 原有的特征聚拢约束[cite: 3] """
         B, C, H, W = feature.size()
         label_down = F.interpolate(label.unsqueeze(1).float(), size=(H, W), mode='nearest').squeeze(1)
         loss_pro, count = 0, 0
-        for i in range(3):  # 遍历 0, 1, 2 三个类别[cite: 7]
+        for i in range(3):
             mask = (label_down == i).unsqueeze(1).expand(-1, C, -1, -1)
             if mask.any():
                 proto = (feature * mask).sum(dim=(0, 2, 3)) / (mask.sum(dim=(0, 2, 3)) + 1e-6)
