@@ -17,7 +17,7 @@ def main():
 
     # 路径保持指向你的 0.81 分真神模型
     parser.add_argument('--model-file', type=str,
-                        default=r'logs/final_uda_run_D2/best_target_model.pth')
+                        default=r'C:\Users\18268\Desktop\PLPB-main\logs\weighted_run\best_model.pth')
 
     parser.add_argument('--data-dir', default=r'C:\Users\18268\Desktop\Fundus')
 
